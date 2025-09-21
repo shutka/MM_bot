@@ -1,17 +1,18 @@
-# main_mm.py
 import time
 import math
 import statistics
 import random
 import threading
 import requests
+import json
+import os
 import ccxt
 
 # ========= CONFIG (заповнити) =========
-API_KEY         = "YOUR_API_KEY"
-API_SECRET      = "YOUR_API_SECRET"
-TELEGRAM_TOKEN  = "YOUR_TELEGRAM_TOKEN"
-CHAT_ID         = "YOUR_CHAT_ID"         # числовий chat_id
+API_KEY         = "esMwwMQF5Jl4cBFEKNwlRdyj4o8fO4KcSRx6uhJyxN4hwthsySBugVvgIwbTQuXp"
+API_SECRET      = "5AjNt4AdZgVAOTsH8HT0hFhTXMPHJmWKtoH7QivUhBowQZChOq97MXflTa5IyHtF"
+TELEGRAM_TOKEN  = "7696383128:AAEBiEkVQx4x4nPSc6N-_6UaySpNH1zsp9c"
+CHAT_ID         = "830034385"         # числовий chat_id
 
 SYMBOL          = "XRP/USDT"             # працюємо з XRP
 QUOTE_BUDGET    = 25.0                   # $ на одну сторону (buy/sell)
@@ -25,6 +26,8 @@ LOOP_SLEEP      = 5                      # сек між ітераціями (�
 STOP_LOSS_PCT   = 3.0 / 100              # страховий стоп по інвентарю
 TAKE_PROFIT_PCT = 0.8 / 100              # TP по інвентарю
 OHLCV_LEN       = 30                     # хвилин вікна для воли
+
+STATE_FILE      = "mm_state.json"
 # ======================================
 
 # --------- Біржа ---------
@@ -40,6 +43,32 @@ price_prec   = mkt["precision"]["price"] or 6
 amt_prec     = mkt["precision"]["amount"] or 6
 lot_min      = (mkt["limits"].get("amount") or {}).get("min", 0.0)
 min_notional = (mkt["limits"].get("cost")   or {}).get("min", 5.0)  # запасний план
+
+# --------- Глобальний стан (зберігаємо в файл) ---------
+state = {
+    "avg_cost": 0.0,            # середня собівартість по локальному обліку
+    "inv_amount": 0.0,          # локальний облік кількості (для realized PnL)
+    "realized_pnl": 0.0,        # сумарний реалізований PnL з моменту старту
+    "last_trade_ts": 0          # останній час трейда (ms)
+}
+def load_state():
+    global state
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                s = json.load(f)
+            state.update(s)
+        except Exception:
+            pass
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+load_state()
 
 paused = False
 last_sent_hash = None
@@ -72,6 +101,7 @@ def fetch_volatility():
     return statistics.pstdev(rets) if rets else 0.0
 
 def portfolio_state():
+    """Фактичний баланс з біржі (ground truth)."""
     bal = ex.fetch_balance()
     base, quote = mkt["base"], mkt["quote"]
     base_amt   = float(bal["total"].get(base, 0.0))
@@ -174,13 +204,78 @@ def place_orders():
             except Exception as e:
                 print(f"[SELL ERR] {e}")
 
+def update_position_from_trade(trade):
+    """Оновлюємо локальний облік інвентаря/собівартості та realized PnL."""
+    global state
+    side = trade.get("side")
+    price = float(trade.get("price"))
+    amount = float(trade.get("amount"))
+    cost = price * amount
+    fee_cost = float(trade.get("fee", {}).get("cost", 0.0))
+    fee_currency = trade.get("fee", {}).get("currency", "")
+
+    # Невеличка поправка: якщо комісія в базовій валюті, зменшуємо amount
+    if fee_cost and fee_currency == mkt["base"]:
+        amount_net = max(0.0, amount - fee_cost)
+    else:
+        amount_net = amount
+
+    avg = state["avg_cost"]
+    inv = state["inv_amount"]
+
+    if side == "buy":
+        new_cost_total = avg * inv + price * amount_net
+        new_inv = inv + amount_net
+        state["avg_cost"] = (new_cost_total / new_inv) if new_inv > 0 else 0.0
+        state["inv_amount"] = new_inv
+    elif side == "sell":
+        # реалізований PnL відносно локальної собівартості
+        sell_amt = min(inv, amount_net)
+        realized = (price - avg) * sell_amt
+        state["realized_pnl"] += realized
+        state["inv_amount"] = max(0.0, inv - sell_amt)
+        # якщо інвентар закрився в нуль — скидаємо собівартість
+        if state["inv_amount"] == 0:
+            state["avg_cost"] = 0.0
+
+    save_state()
+
+def poll_trades_and_notify():
+    """Опитуємо останні трейди, шлемо нотифікації про філи, оновлюємо локальний стан."""
+    global state
+    since = state["last_trade_ts"] or None
+    try:
+        trades = ex.fetch_my_trades(SYMBOL, since=since, limit=50)
+        if not trades:
+            return
+        # сортуємо за часом
+        trades.sort(key=lambda t: t["timestamp"])
+        for t in trades:
+            ts = t["timestamp"]
+            if state["last_trade_ts"] and ts <= state["last_trade_ts"]:
+                continue
+            side = t["side"].upper()
+            price = float(t["price"])
+            amount = float(t["amount"])
+            update_position_from_trade(t)
+            tg_send(f"🧾 Fill {side}: {amount:.2f} {mkt['base']} @ {price:.5f}\n"
+                    f"Inv: {state['inv_amount']:.2f} {mkt['base']} | Avg: {state['avg_cost']:.5f}\n"
+                    f"Realized PnL: {state['realized_pnl']:+.2f} USDT")
+            state["last_trade_ts"] = ts
+        save_state()
+    except Exception as e:
+        print(f"[TRADES ERR] {e}")
+
 def check_fills_and_risk():
-    """Контроль інвентаря: TP/SL за ринком як страховка."""
+    """Контроль інвентаря: TP/SL за ринком як страховка + обробка філів."""
+    poll_trades_and_notify()  # нове: фіксуємо філи / оновлюємо стан
+
     base_amt, base_usd, quote_amt, px = portfolio_state()
     if base_amt <= 0:
         return
-    avg_ref = active["ref_px"] or px
-    pnl_pct = (px - avg_ref) / avg_ref
+    # Для TP/SL використовуємо локальну середню собівартість (консервативно)
+    avg_ref = state["avg_cost"] or (active["ref_px"] or px)
+    pnl_pct = (px - avg_ref) / avg_ref if avg_ref > 0 else 0.0
 
     if pnl_pct >= TAKE_PROFIT_PCT:
         amt = clamp_amount_by_lot(base_amt)
@@ -188,8 +283,7 @@ def check_fills_and_risk():
             try:
                 cancel_if_exists("sell")
                 ex.create_market_sell_order(SYMBOL, amt)
-                msg = f"✅ TP: Продано {amt:.2f} {mkt['base']} ~ {px:.5f}"
-                print(msg); tg_send(msg)
+                tg_send(f"✅ TP: Продано {amt:.2f} {mkt['base']} ~ {px:.5f}")
             except Exception as e:
                 print(f"[TP ERR] {e}")
 
@@ -199,12 +293,11 @@ def check_fills_and_risk():
             try:
                 cancel_if_exists("sell")
                 ex.create_market_sell_order(SYMBOL, amt)
-                msg = f"⛔ SL: Продано {amt:.2f} {mkt['base']} ~ {px:.5f}"
-                print(msg); tg_send(msg)
+                tg_send(f"⛔ SL: Продано {amt:.2f} {mkt['base']} ~ {px:.5f}")
             except Exception as e:
                 print(f"[SL ERR] {e}")
 
-def mm_loop():
+def place_and_manage_loop():
     tg_send(f"🚀 MM-бот стартував: {SYMBOL}")
     cancel_all_open()
     while True:
@@ -263,7 +356,6 @@ def tg_loop():
                         cancel_all_open()
                         tg_send("🧹 Всі відкриті ордери скасовано.")
                     elif text == "/reprice":
-                        # примусове перевиставлення
                         active["ref_px"] = None
                         tg_send("♻️ Запит на перевиставлення ордерів прийнято.")
                     elif text == "/balance":
@@ -281,19 +373,25 @@ def tg_loop():
                             orders = []
                         obuy = next((o for o in orders if o["side"]=="buy"), None)
                         osell= next((o for o in orders if o["side"]=="sell"), None)
-                        spread_info = "—"
-                        if active["ref_px"]:
-                            spread_info = f"ref {active['ref_px']:.5f}"
-                        tg_send(
-                            f"📊 {SYMBOL}\n"
-                            f"Ціна: {px:.5f}\n"
-                            f"Інвентар: {base_amt:.2f} {mkt['base']} (~${base_usd:.2f})\n"
-                            f"USDT: ${quote_amt:.2f}\n"
-                            f"ref/спред: {spread_info}\n"
-                            f"Buy(ord): {obuy['price']:.5f} x {obuy['amount']:.2f}" if obuy else "Buy(ord): —"
-                        )
+
+                        unreal_pnl = 0.0
+                        if state["inv_amount"] > 0 and state["avg_cost"] > 0:
+                            unreal_pnl = (px - state["avg_cost"]) * state["inv_amount"]
+
+                        msg1 = (f"📊 {SYMBOL}\n"
+                                f"Ціна: {px:.5f}\n"
+                                f"Інвентар: {base_amt:.2f} {mkt['base']} (~${base_usd:.2f})\n"
+                                f"USDT: ${quote_amt:.2f}\n"
+                                f"Avg(cost): {state['avg_cost']:.5f}\n"
+                                f"PnL: Unreal {unreal_pnl:+.2f} | Real {state['realized_pnl']:+.2f} USDT")
+                        tg_send(msg1)
+
+                        if obuy:
+                            tg_send(f"Buy(ord): {float(obuy['price']):.5f} x {float(obuy['amount']):.2f}")
+                        else:
+                            tg_send("Buy(ord): —")
                         if osell:
-                            tg_send(f"Sell(ord): {osell['price']:.5f} x {osell['amount']:.2f}")
+                            tg_send(f"Sell(ord): {float(osell['price']):.5f} x {float(osell['amount']):.2f}")
                         else:
                             tg_send("Sell(ord): —")
         except Exception as e:
@@ -302,4 +400,4 @@ def tg_loop():
 
 if __name__ == "__main__":
     threading.Thread(target=tg_loop, daemon=True).start()
-    mm_loop()
+    place_and_manage_loop()
